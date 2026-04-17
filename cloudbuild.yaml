@@ -1,0 +1,32 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-east1-docker.pkg.dev/$PROJECT_ID/elmeeda/elmeeda-watch:$SHORT_SHA'
+      - '-t'
+      - 'us-east1-docker.pkg.dev/$PROJECT_ID/elmeeda/elmeeda-watch:latest'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'us-east1-docker.pkg.dev/$PROJECT_ID/elmeeda/elmeeda-watch'
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Roll the new image onto the existing Cloud Run Job.
+        # (Job name kept as "samsara-watch" to preserve the scheduler wiring.)
+        gcloud run jobs update samsara-watch \
+          --image=us-east1-docker.pkg.dev/$PROJECT_ID/elmeeda/elmeeda-watch:$SHORT_SHA \
+          --region=us-east1 || true
+
+images:
+  - 'us-east1-docker.pkg.dev/$PROJECT_ID/elmeeda/elmeeda-watch'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

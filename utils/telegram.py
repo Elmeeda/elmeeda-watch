@@ -71,15 +71,60 @@ def send_run_summary(
     lines.append(f"*samsara-collector: `{job}`*")
     lines.append(f"_{completed_at.strftime('%Y-%m-%d %H:%M:%SZ')}{duration}_")
 
-    # Top-level stats
+    stats = stats or {}
+    context = stats.get("context") if isinstance(stats.get("context"), dict) else None
+
+    # Top-level stats (skip keys rendered specially below)
+    _special_keys = {"context"}
     top_rows: list[tuple[str, str]] = []
-    for k, v in (stats or {}).items():
-        if isinstance(v, dict):
-            continue  # nested → rendered below
+    for k, v in stats.items():
+        if k in _special_keys or isinstance(v, dict):
+            continue
         top_rows.append((str(k), str(v)))
     if top_rows:
         lines.append("```")
         lines.append(_format_table(top_rows))
+        lines.append("```")
+
+    # Informative zero-state for watch-faults — the realtime webhook's
+    # catching everything, watcher has nothing to catch up on.
+    if (
+        job == "watch-faults"
+        and stats.get("events_scanned", 1) == 0
+        and stats.get("dispatches_created", 0) == 0
+        and context
+        and context.get("total", 0) > 0
+    ):
+        status_bits = ", ".join(f"{k}={v}" for k, v in context["by_status"].items())
+        lines.append(
+            f"_✓ All faults handled by realtime webhook — nothing for watcher to catch up "
+            f"(last {context.get('window_minutes', 60)}m: {context.get('total')} events → {status_bits})_"
+        )
+
+    # Backend activity context (last-hour window, all pipeline_status buckets)
+    if context and context.get("total"):
+        win = context.get("window_minutes", 60)
+        lines.append(f"*Backend activity · last {win}m*")
+        rows = [(k, str(v)) for k, v in context.get("by_status", {}).items()]
+        if rows:
+            lines.append("```")
+            lines.append(_format_table(rows))
+            lines.append("```")
+
+    # Top recent faults
+    top_faults = (context or {}).get("top_faults") or []
+    if top_faults:
+        lines.append("*Top recent faults*")
+        lines.append("```")
+        fault_rows = []
+        for f in top_faults:
+            sev = f.get("severity")
+            age = f.get("age_min")
+            age_str = f"{age}m ago" if age is not None else "?"
+            label = f"#{f.get('unit') or '-'}  {f.get('code')}"
+            tail = f"sev {sev if sev is not None else '-'}  {f.get('category') or '-'}  [{f.get('status')}] {age_str}"
+            fault_rows.append((label, tail))
+        lines.append(_format_table(fault_rows))
         lines.append("```")
 
     # Per-tenant breakdown when provided
@@ -92,13 +137,26 @@ def send_run_summary(
             if "summary" in t:
                 tenant_rows.append((label, str(t["summary"])))
             else:
-                tenant_rows.append((label, ", ".join(f"{k}={v}" for k, v in t.items() if k != "name")))
+                tenant_rows.append((label, ", ".join(f"{k}={v}" for k, v in t.items() if k not in ("name", "details"))))
         lines.append(_format_table(tenant_rows))
         lines.append("```")
 
-    # Nested sub-collector results (for collect-full)
-    for k, v in (stats or {}).items():
-        if not isinstance(v, dict):
+        # Per-dispatch detail rows — only present when the watcher actually
+        # created dispatches, so zero-state summaries stay terse.
+        detail_rows: list[str] = []
+        for tid, t in tenants.items():
+            for d in t.get("details") or []:
+                tag = t.get("name") or tid[:8]
+                detail_rows.append(f"{tag}  {d}")
+        if detail_rows:
+            lines.append("*Dispatches created*")
+            lines.append("```")
+            lines.extend(detail_rows)
+            lines.append("```")
+
+    # Nested sub-collector results (for collect-full) — unchanged
+    for k, v in stats.items():
+        if k in _special_keys or not isinstance(v, dict):
             continue
         sub_rows = [(sk, str(sv)) for sk, sv in v.items() if not isinstance(sv, (dict, list))]
         if not sub_rows:

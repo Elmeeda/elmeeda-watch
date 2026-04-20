@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 _SEVERITY_FLOOR = 80             # matches existing auto-dispatch threshold
 _DEDUP_WINDOW_HOURS = 1          # skip if recent dispatch exists for same vehicle
 _LOOKBACK_HOURS = 24             # don't dispatch events older than this
+_CONTEXT_WINDOW_MIN = 60         # show backend activity over this window in the summary
+_CONTEXT_RECENT_LIMIT = 5        # top-N recent faults shown even when watcher catches nothing
 
 
 def _tenant_name(db: Session, tenant_id: str) -> str:
@@ -32,6 +34,56 @@ def _tenant_name(db: Session, tenant_id: str) -> str:
         return (row[0] if row and row[0] else tenant_id[:8])
     except Exception:
         return tenant_id[:8]
+
+
+def _collect_context(db: Session, now: datetime) -> dict:
+    """Snapshot of fleet-wide fault activity in the last _CONTEXT_WINDOW_MIN.
+
+    Used by the Telegram summary to prove the pipeline is alive even when
+    the watcher sweep has nothing to catch (i.e. the realtime webhook
+    already handled everything). Returns a dict safe to nest into stats.
+    """
+    since = now - timedelta(minutes=_CONTEXT_WINDOW_MIN)
+    out: dict = {"window_minutes": _CONTEXT_WINDOW_MIN, "by_status": {}, "top_faults": []}
+    try:
+        rows = db.execute(text("""
+            SELECT COALESCE(pipeline_status, 'unprocessed') AS status, COUNT(*) AS n
+              FROM fault_code_change_events
+             WHERE detected_at > :since
+               AND event_type IN ('appeared', 'recurred')
+               AND severity_score IS NOT NULL
+             GROUP BY COALESCE(pipeline_status, 'unprocessed')
+        """), {"since": since}).fetchall()
+        out["by_status"] = {r[0]: int(r[1]) for r in rows}
+        out["total"] = sum(out["by_status"].values())
+
+        # Top recent faults — highest severity, most recent
+        rows = db.execute(text("""
+            SELECT unit_number, spn, fmi, dtc_code, severity_score,
+                   component_category, pipeline_status, detected_at
+              FROM fault_code_change_events
+             WHERE detected_at > :since
+               AND event_type IN ('appeared', 'recurred')
+             ORDER BY severity_score DESC NULLS LAST, detected_at DESC
+             LIMIT :lim
+        """), {"since": since, "lim": _CONTEXT_RECENT_LIMIT}).fetchall()
+        for r in rows:
+            unit, spn, fmi, dtc, sev, cat, status, detected = r
+            code_parts: list[str] = []
+            if spn is not None: code_parts.append(f"SPN{spn}")
+            if fmi is not None: code_parts.append(f"FMI{fmi}")
+            if dtc: code_parts.append(f"DTC{dtc}")
+            out["top_faults"].append({
+                "unit": unit or "-",
+                "code": "/".join(code_parts) or "-",
+                "severity": int(sev) if sev is not None else None,
+                "category": cat or "-",
+                "status": status or "unprocessed",
+                "age_min": int((now - detected).total_seconds() / 60) if detected else None,
+            })
+    except Exception as e:
+        logger.warning("samsara_watch_context_failed: %s", e)
+    return out
 
 
 def watch_fault_codes(db: Session):
@@ -63,8 +115,11 @@ def watch_fault_codes(db: Session):
     """), {"cutoff": cutoff}).fetchall()
 
     stats["events_scanned"] = len(rows)
+    # Always collect context so the Telegram summary has something to say
+    # when the watcher has nothing to do (the healthy steady-state).
+    stats["context"] = _collect_context(db, now)
     if not rows:
-        logger.info("samsara_watch: no candidate events")
+        logger.info("samsara_watch: no candidate events (context=%s)", stats["context"].get("by_status"))
         return stats, tenants
 
     for r in rows:
@@ -76,6 +131,7 @@ def watch_fault_codes(db: Session):
             "created": 0,
             "dedup": 0,
             "below": 0,
+            "details": [],
         })
 
         if (severity_score or 0) < _SEVERITY_FLOOR:
@@ -178,6 +234,14 @@ def watch_fault_codes(db: Session):
 
             stats["dispatches_created"] += 1
             tb["created"] += 1
+            code_parts: list[str] = []
+            if spn is not None: code_parts.append(f"SPN{spn}")
+            if fmi is not None: code_parts.append(f"FMI{fmi}")
+            if dtc_code: code_parts.append(f"DTC{dtc_code}")
+            tb["details"].append(
+                f"#{unit_number or '?'}  {'/'.join(code_parts) or '-'}  "
+                f"sev {severity_score}  ({component_category or '-'})  → {dispatch_id[:8]}"
+            )
             logger.info(
                 "samsara_watch_dispatched | tenant=%s unit=%s spn=%s fmi=%s severity=%s dispatch=%s",
                 tenant_id, unit_number, spn, fmi, severity_score, dispatch_id,
@@ -204,7 +268,10 @@ def watch_fault_codes(db: Session):
         if t["created"]: parts.append(f"{t['created']} new")
         if t["dedup"]:   parts.append(f"{t['dedup']} dedup")
         if t["below"]:   parts.append(f"{t['below']} below")
-        out[tid] = {"name": t["name"], "summary": ", ".join(parts) or "nothing"}
+        row: dict = {"name": t["name"], "summary": ", ".join(parts) or "nothing"}
+        if t.get("details"):
+            row["details"] = t["details"]
+        out[tid] = row
 
     logger.info(f"samsara-watch: {stats}")
     return stats, out

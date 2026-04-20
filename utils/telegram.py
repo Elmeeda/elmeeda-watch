@@ -86,20 +86,32 @@ def send_run_summary(
         lines.append(_format_table(top_rows))
         lines.append("```")
 
-    # Informative zero-state for watch-faults — the realtime webhook's
-    # catching everything, watcher has nothing to catch up on.
+    # One-liner status for watch-faults — distinguishes the three cases:
+    #   1. All in terminal states → truly healthy, nothing to do
+    #   2. Pending/processing exist → other path is in-flight, flag it
+    #   3. Totally quiet (context.total = 0) → no recent fault activity at all
     if (
         job == "watch-faults"
         and stats.get("events_scanned", 1) == 0
         and stats.get("dispatches_created", 0) == 0
         and context
-        and context.get("total", 0) > 0
     ):
-        status_bits = ", ".join(f"{k}={v}" for k, v in context["by_status"].items())
-        lines.append(
-            f"_✓ All faults handled by realtime webhook — nothing for watcher to catch up "
-            f"(last {context.get('window_minutes', 60)}m: {context.get('total')} events → {status_bits})_"
-        )
+        by_status = context.get("by_status") or {}
+        total = context.get("total", 0)
+        window = context.get("window_minutes", 60)
+        terminal = {"dispatched_pending_review", "skipped", "below_threshold", "processed", "failed"}
+        stuck = sum(v for k, v in by_status.items() if k not in terminal)
+        if total == 0:
+            lines.append(f"_No fault activity in last {window}m — fleet quiet._")
+        elif stuck == 0:
+            lines.append(
+                f"_✓ All {total} fault events in last {window}m handled (watcher sweep: nothing to catch up)._"
+            )
+        else:
+            stuck_bits = ", ".join(f"{k}={v}" for k, v in by_status.items() if k not in terminal)
+            lines.append(
+                f"_⚠ Watcher sweep empty but {stuck}/{total} events still non-terminal in last {window}m ({stuck_bits})._"
+            )
 
     # Backend activity context (last-hour window, all pipeline_status buckets)
     if context and context.get("total"):
